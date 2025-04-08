@@ -22,7 +22,7 @@ pub struct Addrs {
 
 #[derive(Deserialize)]
 pub struct Database {
-    pub path: String, // path to local database file
+    pub file: String, // name of local database file
 }
 
 #[derive(Deserialize)]

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
+    path::PathBuf,
     sync::{mpsc, Arc, Mutex, RwLock},
     thread::{self, sleep},
     time::{Duration, Instant},
@@ -80,6 +81,7 @@ struct DataPoint {
 
 struct Forwarder {
     config: Arc<Config>,
+    db_path: Arc<PathBuf>,
     sensor_socket: Arc<Mutex<Option<WebSocket<TcpStream>>>>,
     sensor_connected: Arc<RwLock<bool>>,
     clients: Arc<RwLock<Vec<Mutex<WebSocket<TcpStream>>>>>,
@@ -88,31 +90,39 @@ struct Forwarder {
 }
 
 impl Forwarder {
-    fn new(config: Config) -> Self {
+    fn new(config: Config, mut source: PathBuf) -> Self {
         // open a connection to the db and create the table
-        let db = Self::get_db_conn(&config.database.path);
-        if let Err(_) = db.execute_batch(&format!("PRAGMA journal_mode=WAL; {TABLE_QUERY};")) {
-            panic!("Failed to create table on database.");
-        }
-        let _ = db.close();
-
-        println!("num cpus: {}", num_cpus::get());
+        source.push(&config.database.file);
         let sample_count = config.debug.interval;
-        Forwarder {
+        println!("num cpus: {}", num_cpus::get());
+
+        let fwd = Forwarder {
             config: Arc::new(config),
+            db_path: Arc::new(source),
             sensor_socket: Arc::new(Mutex::new(None)),
             sensor_connected: Arc::new(RwLock::new(false)),
             clients: Arc::new(RwLock::new(Vec::new())),
             #[cfg(debug_assertions)]
             timing_samples: Vec::with_capacity(sample_count),
+        };
+
+        let db = fwd.get_db_conn();
+        if let Err(_) = db.execute_batch(&format!("PRAGMA journal_mode=WAL; {TABLE_QUERY};")) {
+            panic!("Failed to create table on database.");
         }
+        let _ = db.close();
+
+        fwd
     }
 
     // returns a connection to the DB file at the passed path
-    fn get_db_conn(path: &str) -> Connection {
-        match Connection::open(path) {
+    fn get_db_conn(&self) -> Connection {
+        match Connection::open(self.db_path.as_path()) {
             Ok(db) => db,
-            Err(_) => panic!("Failed to open database file at {path}."),
+            Err(_) => panic!(
+                "Failed to open database file at {:?}.",
+                self.db_path.as_path()
+            ),
         }
     }
 
@@ -120,9 +130,9 @@ impl Forwarder {
     fn run(&mut self) {
         //start batch thread to TCP server
         let batch_config = self.config.clone();
+        let mut batch_db = self.get_db_conn();
         thread::spawn(move || {
             // get threads connection to DB
-            let mut batch_db = Forwarder::get_db_conn(&batch_config.database.path);
             let mut json_buffer = Vec::with_capacity(32 * batch_config.batch.count); // TODO: adjust based on actual data size
             loop {
                 // send data once batch count is reached
@@ -309,10 +319,9 @@ impl Forwarder {
 
         // start data storage thread
         let (data_tx, data_rx) = mpsc::channel::<Bytes>();
-        let data_config = self.config.clone();
+        let db_conn = self.get_db_conn();
         thread::spawn(move || {
             // get threads connection to DB
-            let db_conn = Forwarder::get_db_conn(&data_config.database.path);
             loop {
                 match data_rx.recv() {
                     //TODO: ensure data.to_vec() works as expected
@@ -426,10 +435,11 @@ fn main() {
     match std::env::current_dir() {
         Ok(mut path) => {
             path.push("src");
+            let source = path.clone();
             path.push("config.toml");
             match std::fs::read_to_string(&path) {
                 Ok(config_str) => match toml::from_str::<Config>(&config_str) {
-                    Ok(toml_config) => Forwarder::new(toml_config).run(),
+                    Ok(toml_config) => Forwarder::new(toml_config, source).run(),
                     Err(e) => panic!(
                         "Failed to parse file 'config.toml' at {:?} as valid TOML: {e}",
                         path
