@@ -73,16 +73,10 @@ const BATCH_QUERY: &str = const_concat!(
 );
 const SESSION_SENSOR_ID: usize = 1;
 
-#[derive(Serialize, Deserialize)]
-struct DataBlob {
-    #[serde(with = "serde_bytes")]
-    sensor_data: Vec<u8>, //TODO: this may need to be all the rows instead
-}
-
 #[derive(Deserialize)]
 struct DataPoint {
     timestamp: String,
-    sensor_blob: DataBlob,
+    sensor_blob: Vec<u8>,
 }
 
 struct Forwarder {
@@ -101,6 +95,7 @@ impl Forwarder {
         println!("num cpus: {}", num_cpus::get());
 
         // open a connection to the db and create the table
+        source.push("database");
         source.push(&config.database.file);
         let sample_count = config.debug.interval;
 
@@ -140,7 +135,7 @@ impl Forwarder {
         println!("Starting batch thread");
         let batch_config = self.config.clone();
         let mut batch_db = self.get_db_conn();
-        thread::spawn(move || {
+        let _batch_thread = thread::spawn(move || {
             // get threads connection to DB
             let mut json_buffer = Vec::with_capacity(32 * batch_config.batch.count); // TODO: adjust based on actual data size
             loop {
@@ -165,6 +160,7 @@ impl Forwarder {
                             row.get::<_, Vec<u8>>(1)
                                 .map(|blob| match String::from_utf8(blob) {
                                     Ok(blob_str) => {
+                                        eprintln!("{blob_str}");
                                         match serde_json::from_str::<DataPoint>(&blob_str) {
                                             Ok(datapoint) => datapoint,
                                             Err(e) => {
@@ -258,12 +254,12 @@ impl Forwarder {
         let sensor_clone = self.sensor_socket.clone();
         let exists_clone = self.sensor_connected.clone();
         let acceptor_config = self.config.clone();
-        thread::spawn(move || {
+        let _client_thread = thread::spawn(move || {
             let listener = match TcpListener::bind(&acceptor_config.addrs.local) {
                 Ok(l) => {
                     println!("Server listening at {}", acceptor_config.addrs.local);
                     l
-                },
+                }
                 Err(_) => panic!(
                     "Failed to bind server at address {}.",
                     acceptor_config.addrs.local
@@ -291,7 +287,7 @@ impl Forwarder {
                 let client_list = acceptor_clients.clone();
                 let sensor_ref = sensor_clone.clone();
                 let exists_ref = exists_clone.clone();
-                thread::spawn(move || {
+                let _message_thread = thread::spawn(move || {
                     match ws_stream.read() {
                         Ok(Message::Binary(data)) => {
                             // sensors send 'S' as first char in first message
@@ -338,7 +334,7 @@ impl Forwarder {
         // start data storage thread
         let (data_tx, data_rx) = mpsc::channel::<Bytes>();
         let db_conn = self.get_db_conn();
-        thread::spawn(move || {
+        let _db_thread = thread::spawn(move || {
             // get threads connection to DB
             loop {
                 match data_rx.recv() {
@@ -417,7 +413,7 @@ impl Forwarder {
                                     sum.as_secs(),
                                     min.as_millis(),
                                     max.as_millis(),
-                                    sum.as_millis() as usize/self.config.debug.interval
+                                    sum.as_millis() as usize / self.config.debug.interval
                                 );
                                 self.timing_samples.clear();
                             }
