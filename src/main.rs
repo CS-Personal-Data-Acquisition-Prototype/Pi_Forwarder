@@ -1,13 +1,8 @@
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{
-    io::{Read, Write},
-    net::{TcpListener, TcpStream},
-    path::PathBuf,
-    sync::{mpsc, Arc, Mutex, RwLock},
-    thread::{self, sleep},
-    time::{Duration, Instant},
+    fs::create_dir, io::{Read, Write}, net::{TcpListener, TcpStream}, path::PathBuf, sync::{mpsc, Arc, Mutex, RwLock}, thread::{self, sleep}, time::{Duration, Instant}
 };
 use tungstenite::{accept, Bytes, Message, WebSocket};
 
@@ -96,6 +91,11 @@ impl Forwarder {
 
         // open a connection to the db and create the table
         source.push("database");
+        if !source.exists() {
+            if let Err(e) = create_dir(&source) {
+                panic!("Failed to create database folder: {e}");
+            }
+        }
         source.push(&config.database.file);
         let sample_count = config.debug.interval;
 
