@@ -64,7 +64,13 @@ const TABLE_QUERY: &str = const_concat!(
     " (id INTEGER PRIMARY KEY AUTOINCREMENT, data BLOB NOT NULL)"
 );
 const INSERT_QUERY: &str = const_concat!("INSERT INTO ", TABLE_NAME, " (data) VALUES (?1)");
-const BATCH_QUERY: &str = const_concat!("DELETE FROM ", TABLE_NAME, " LIMIT ?1 RETURNING *");
+const BATCH_QUERY: &str = const_concat!(
+    "DELETE FROM ",
+    TABLE_NAME,
+    " WHERE id IN (SELECT id FROM ",
+    TABLE_NAME,
+    " LIMIT ?1) RETURNING *"
+);
 const SESSION_SENSOR_ID: usize = 1;
 
 #[derive(Serialize, Deserialize)]
@@ -91,10 +97,12 @@ struct Forwarder {
 
 impl Forwarder {
     fn new(config: Config, mut source: PathBuf) -> Self {
+        println!("Sqlite Version: {}", rusqlite::version());
+        println!("num cpus: {}", num_cpus::get());
+
         // open a connection to the db and create the table
         source.push(&config.database.file);
         let sample_count = config.debug.interval;
-        println!("num cpus: {}", num_cpus::get());
 
         let fwd = Forwarder {
             config: Arc::new(config),
