@@ -1,8 +1,5 @@
-server_config.txt
-
 # Ignore configuration files
-config.ini
-config.rs
+*config.toml
 
 # Ignore database files
 *.db
@@ -10,6 +7,7 @@ config.rs
 *.sqlite3
 
 # Rust build artifacts
+debug/
 /target/
 Cargo.lock
 **/*.rs.bk

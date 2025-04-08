@@ -1,5 +1,6 @@
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -9,11 +10,14 @@ use std::{
 };
 use tungstenite::{accept, Bytes, Message, WebSocket};
 
-//macro used to concatanate constants, allows values shared across constants to be pulled out
-//incurs zero runtime and memory cost as its fully evaluated at compile-time and any intermediate values are removed
+mod config;
+use config::Config;
+
+// macro used to concatanate constants, allows values shared across constants to be pulled out
+// incurs zero runtime and memory cost as its fully evaluated at compile-time and any intermediate values are removed
 macro_rules! const_concat {
     ($($sub_str: expr),+ $(,)?) => {{
-        //get number of parts and total length
+        // get number of parts and total length
         const PARTS: &[&str] = &[ $($sub_str),+ ];
         const LEN: usize = {
             let mut len = 0;
@@ -43,7 +47,7 @@ macro_rules! const_concat {
             out
         }
 
-        //convert from byte array to &str
+        // convert from byte array to &str
         match std::str::from_utf8(&combined()) {
             Ok(s) => s,
             Err(_) => panic!("Failed to concatenate const strings with macro during compile."),
@@ -51,69 +55,31 @@ macro_rules! const_concat {
     }};
 }
 
-//converts an int to static str
-//can use on smaller values without runtime or memory overhead using 'n as u128'
-const fn u128_to_str(n: u128) -> &'static str {
-    if n == 0 {
-        return "0";
-    }
-
-    // write digits in reverse
-    const MAX_DIGITS: usize = 39; // u189 max is 39 digits (340,282,366,920,938,463,463,374,607,431,768,211,455)
-    let mut buf = [0u8; MAX_DIGITS];
-    let mut i = 0;
-    let mut num = n;
-    while num > 0 {
-        buf[(MAX_DIGITS - 1) - i] = b'0' + (num % 10) as u8;
-        num /= 10;
-        i += 1;
-    }
-
-    // trim to size
-    let mut out = [0u8; MAX_DIGITS];
-    let mut j = 0;
-    while j < i {
-        out[j] = buf[MAX_DIGITS - i + j];
-        j += 1;
-    }
-
-    // convert bytes to &str then to static str
-    match std::str::from_utf8(&out) {
-        // this is safe as only ASCII 0-9 is written and we are in const which is compile-time
-        Ok(s) => unsafe { std::mem::transmute::<&str, &'static str>(s) },
-        Err(_) => panic!("Failed to convert u128 to static str with macro during compile."),
-    }
-}
-
-const TARGET_INTERVAL: Duration = Duration::from_millis(10); //100hz
-const STATS_INTERVAL: usize = 3000;
-
-// local address to listen for connections on
-const LOCAL_SERVER_ADDR: &str = "0.0.0.0:7878";
-// address to send TCP batches to
-const SERVER_ADDR: &str = "";
-// specific endpoint to send batch requests to
-const BATCH_ENDPOINT: &str = "";
-const DB_PATH: &str = "../src/data_acquisition.db";
-
+// consts holding SQL queries
 const TABLE_NAME: &str = "sensor_data";
 const TABLE_QUERY: &str = const_concat!(
     "CREATE TABLE IF NOT EXISTS ",
     TABLE_NAME,
     " (id INTEGER PRIMARY KEY AUTOINCREMENT, data BLOB NOT NULL)"
 );
-const INSERT_QUERY: &str = const_concat!(
-    "INSERT INTO ",
-    TABLE_NAME,
-    " (data) VALUES (?1)"
-);
+const INSERT_QUERY: &str = const_concat!("INSERT INTO ", TABLE_NAME, " (data) VALUES (?1)");
 const BATCH_QUERY: &str = const_concat!("DELETE FROM ", TABLE_NAME, " LIMIT ?1 RETURNING *");
-// time in seconds to wait between batches
-const BATCH_INTERVAL: u64 = 10;
-// number of rows to send in a batch
-const BATCH_COUNT: u32 = 10000;
+const SESSION_SENSOR_ID: usize = 1;
+
+#[derive(Serialize, Deserialize)]
+struct DataBlob {
+    #[serde(with = "serde_bytes")]
+    sensor_data: Vec<u8>, //TODO: this may need to be all the rows instead
+}
+
+#[derive(Deserialize)]
+struct DataPoint {
+    timestamp: String,
+    sensor_blob: DataBlob,
+}
 
 struct Forwarder {
+    config: Arc<Config>,
     sensor_socket: Arc<Mutex<Option<WebSocket<TcpStream>>>>,
     sensor_connected: Arc<RwLock<bool>>,
     clients: Arc<RwLock<Vec<Mutex<WebSocket<TcpStream>>>>>,
@@ -122,39 +88,45 @@ struct Forwarder {
 }
 
 impl Forwarder {
-    fn new() -> Self {
-        //TODO: could open table in memory and only but in db file when that fills?
-        let db = Self::get_db_conn();
-        if let Err(_) = db.execute_batch(TABLE_QUERY) {
+    fn new(config: Config) -> Self {
+        // open a connection to the db and create the table
+        let db = Self::get_db_conn(&config.database.path);
+        if let Err(_) = db.execute_batch(&format!("PRAGMA journal_mode=WAL; {TABLE_QUERY};")) {
             panic!("Failed to create table on database.");
         }
         let _ = db.close();
 
         println!("num cpus: {}", num_cpus::get());
+        let sample_count = config.debug.interval;
         Forwarder {
+            config: Arc::new(config),
             sensor_socket: Arc::new(Mutex::new(None)),
             sensor_connected: Arc::new(RwLock::new(false)),
             clients: Arc::new(RwLock::new(Vec::new())),
             #[cfg(debug_assertions)]
-            timing_samples: Vec::with_capacity(STATS_INTERVAL),
+            timing_samples: Vec::with_capacity(sample_count),
         }
     }
 
-    fn get_db_conn() -> Connection {
-        match Connection::open(DB_PATH) {
+    // returns a connection to the DB file at the passed path
+    fn get_db_conn(path: &str) -> Connection {
+        match Connection::open(path) {
             Ok(db) => db,
-            Err(_) => panic!("Failed to open database file at {DB_PATH}."),
+            Err(_) => panic!("Failed to open database file at {path}."),
         }
     }
 
+    //TODO: could open table in memory and only but in db file when that fills?
     fn run(&mut self) {
         //start batch thread to TCP server
+        let batch_config = self.config.clone();
         thread::spawn(move || {
             // get threads connection to DB
-            let mut batch_db = Forwarder::get_db_conn();
+            let mut batch_db = Forwarder::get_db_conn(&batch_config.database.path);
+            let mut json_buffer = Vec::with_capacity(32 * batch_config.batch.count); // TODO: adjust based on actual data size
             loop {
                 // send data once batch count is reached
-                sleep(Duration::from_secs(BATCH_INTERVAL));
+                sleep(Duration::from_secs(batch_config.batch.interval));
 
                 // start transaction with DB connection
                 let tx = match batch_db.transaction() {
@@ -165,21 +137,37 @@ impl Forwarder {
                     }
                 };
 
-                // //get row blobs as vectors of u8 to batch send
+                // //get row blobs as parsed structs
                 let batch = match tx.prepare(BATCH_QUERY) {
-                    Ok(mut stmt) => match stmt.query_map(params![BATCH_COUNT], |row| row.get::<_, Vec<u8>>(0)) {
-                        Ok(r) => match r.collect::<Result<Vec<_>, _>>() {
-                            Ok(b) => b,
+                    Ok(mut stmt) => {
+                        let batch_count = batch_config.batch.count;
+                        match stmt.query_map(params![batch_count], |row| {
+                            row.get::<_, Vec<u8>>(0)
+                                .map(|blob| match String::from_utf8(blob) {
+                                    Ok(blob_str) => {
+                                        match serde_json::from_str::<DataPoint>(&blob_str) {
+                                            Ok(datapoint) => datapoint,
+                                            Err(e) => {
+                                                panic!("Failed to parse row into datapoint: {e}")
+                                            }
+                                        }
+                                    }
+                                    Err(e) => panic!("Expected only valid UTF-8 in blob data: {e}"),
+                                })
+                        }) {
+                            Ok(r) => match r.collect::<Result<Vec<_>, _>>() {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    eprintln!("Failed to collect rows from query result: {e}");
+                                    Vec::new()
+                                }
+                            },
                             Err(e) => {
-                                eprintln!("Failed to collect rows from query result: {e}");
+                                eprintln!("Failed to execute batch query against DB: {e}");
                                 Vec::new()
                             }
-                        },
-                        Err(e) => {
-                            eprintln!("Failed to execute batch query against DB: {e}");
-                            Vec::new()
                         }
-                    },
+                    }
                     Err(e) => {
                         eprintln!("Failed to prepare statement: {}", e);
                         continue;
@@ -188,19 +176,44 @@ impl Forwarder {
 
                 if !batch.is_empty() {
                     // format batch to server expectations
-                    let json = "";
-                    let len = json.len();
+                    json_buffer.clear();
+                    json_buffer.append(r#"{"datapoints":["#.as_bytes().to_vec().as_mut());
 
-                    // format request
+                    for (i, datapoint) in batch.iter().enumerate() {
+                        if i > 0 {
+                            json_buffer.push(',' as u8);
+                        }
+                        if let Err(e) = write!(
+                            &mut json_buffer,
+                            r#"{{"id":{},"datetime":{},data_blob:{}}}"#,
+                            SESSION_SENSOR_ID,
+                            datapoint.timestamp,
+                            match serde_json::to_string(&datapoint.sensor_blob) {
+                                Ok(blob_str) => blob_str,
+                                Err(e) => panic!("Failed to parse data blob: {e}"),
+                            }
+                        ) {
+                            panic!("Failed to write to json buffer: {e}")
+                        }
+                    }
+                    json_buffer.append("]}".as_bytes().to_vec().as_mut());
+
+                    #[cfg(debug_assertions)]
+                    println!("Batch parse buffer size: {}", &json_buffer.capacity());
+
+                    // format TCP request
                     let request = format!(
-                        "POST {BATCH_ENDPOINT} HTTP/1,1\r\n
+                        "POST {} HTTP/1,1\r\n
                         Content-Type: application/json\r\n
-                        Content-Length: {len}\r\n\r\n
-                        {json}"
+                        Content-Length: {}\r\n\r\n
+                        {}",
+                        &batch_config.addrs.endpoint,
+                        &json_buffer.len(),
+                        String::from_utf8_lossy(&json_buffer),
                     );
 
-                    // send via TCP
-                    if let Ok(mut stream) = TcpStream::connect(SERVER_ADDR) {
+                    // send data via TCP to remote server
+                    if let Ok(mut stream) = TcpStream::connect(&batch_config.addrs.remote) {
                         if stream.write_all(request.as_bytes()).is_ok() {
                             // check for 204 response
                             let mut response = String::new();
@@ -222,10 +235,14 @@ impl Forwarder {
         let acceptor_clients = self.clients.clone();
         let sensor_clone = self.sensor_socket.clone();
         let exists_clone = self.sensor_connected.clone();
+        let acceptor_config = self.config.clone();
         thread::spawn(move || {
-            let listener = match TcpListener::bind(LOCAL_SERVER_ADDR) {
+            let listener = match TcpListener::bind(&acceptor_config.addrs.local) {
                 Ok(l) => l,
-                Err(_) => panic!("Failed to bind server at address {LOCAL_SERVER_ADDR}."),
+                Err(_) => panic!(
+                    "Failed to bind server at address {}.",
+                    acceptor_config.addrs.local
+                ),
             };
 
             // accept incoming connections into websockets
@@ -292,15 +309,18 @@ impl Forwarder {
 
         // start data storage thread
         let (data_tx, data_rx) = mpsc::channel::<Bytes>();
+        let data_config = self.config.clone();
         thread::spawn(move || {
             // get threads connection to DB
-            let db_conn = Forwarder::get_db_conn();
+            let db_conn = Forwarder::get_db_conn(&data_config.database.path);
             loop {
                 match data_rx.recv() {
                     //TODO: ensure data.to_vec() works as expected
-                    Ok(data) => if let Err(e) = db_conn.execute(INSERT_QUERY, params![data.to_vec()]) {
-                        panic!("Failed to execute INSERT_QUERY with DB connection: {e}")
-                    },
+                    Ok(data) => {
+                        if let Err(e) = db_conn.execute(INSERT_QUERY, params![data.to_vec()]) {
+                            panic!("Failed to execute INSERT_QUERY with DB connection: {e}")
+                        }
+                    }
                     Err(e) => panic!("Failed to recieve DB data from the channel: {e}"),
                 };
             }
@@ -324,7 +344,7 @@ impl Forwarder {
                     //  if somehow no socket, drop lock and wait short time
                     None => {
                         drop(guard);
-                        sleep(TARGET_INTERVAL / 2);
+                        sleep(Duration::from_millis(self.config.batch.interval / 2));
                         continue;
                     }
                     Some(socket) => match socket.read() {
@@ -345,7 +365,7 @@ impl Forwarder {
                             #[cfg(debug_assertions)]
                             {
                                 self.timing_samples.push(start.elapsed());
-                                if self.timing_samples.len() >= STATS_INTERVAL {
+                                if self.timing_samples.len() >= self.config.debug.interval {
                                     let (min, max, sum) = self
                                         .timing_samples
                                         .par_iter()
@@ -360,11 +380,12 @@ impl Forwarder {
                                             },
                                         );
                                     println!(
-                                        "{STATS_INTERVAL} cycles took {} total seconds. Min: {}, Max: {}, Avg: {}",
+                                        "{} cycles took {} total seconds. Min: {}, Max: {}, Avg: {}",
+                                        self.config.debug.interval,
                                         sum.as_secs(),
                                         min.as_millis(),
                                         max.as_millis(),
-                                        sum.as_millis() as usize/STATS_INTERVAL
+                                        sum.as_millis() as usize/self.config.debug.interval
                                     );
                                     self.timing_samples.clear();
                                 }
@@ -402,5 +423,24 @@ impl Forwarder {
 }
 
 fn main() {
-    Forwarder::new().run();
+    match std::env::current_dir() {
+        Ok(mut path) => {
+            path.push("src");
+            path.push("config.toml");
+            match std::fs::read_to_string(&path) {
+                Ok(config_str) => match toml::from_str::<Config>(&config_str) {
+                    Ok(toml_config) => Forwarder::new(toml_config).run(),
+                    Err(e) => panic!(
+                        "Failed to parse file 'config.toml' at {:?} as valid TOML: {e}",
+                        path
+                    ),
+                },
+                Err(e) => panic!(
+                    "Failed to open configuration file 'config.toml' at {:?}: {e}",
+                    path
+                ),
+            }
+        }
+        Err(e) => panic!("Failed to get current directory: {e}"),
+    }
 }
