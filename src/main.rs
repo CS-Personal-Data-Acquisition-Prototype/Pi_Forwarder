@@ -137,6 +137,7 @@ impl Forwarder {
     //TODO: could open table in memory and only but in db file when that fills?
     fn run(&mut self) {
         //start batch thread to TCP server
+        println!("Starting batch thread");
         let batch_config = self.config.clone();
         let mut batch_db = self.get_db_conn();
         thread::spawn(move || {
@@ -155,7 +156,8 @@ impl Forwarder {
                     }
                 };
 
-                // //get row blobs as parsed structs
+                // get row blobs as parsed structs
+                println!("Getting batch to send");
                 let batch = match tx.prepare(BATCH_QUERY) {
                     Ok(mut stmt) => {
                         let batch_count = batch_config.batch.count;
@@ -231,6 +233,7 @@ impl Forwarder {
                     );
 
                     // send data via TCP to remote server
+                    println!("Sending batch");
                     if let Ok(mut stream) = TcpStream::connect(&batch_config.addrs.remote) {
                         if stream.write_all(request.as_bytes()).is_ok() {
                             // check for 204 response
@@ -250,13 +253,17 @@ impl Forwarder {
         });
 
         // start client acceptor thread
+        println!("Starting client acceptor thread");
         let acceptor_clients = self.clients.clone();
         let sensor_clone = self.sensor_socket.clone();
         let exists_clone = self.sensor_connected.clone();
         let acceptor_config = self.config.clone();
         thread::spawn(move || {
             let listener = match TcpListener::bind(&acceptor_config.addrs.local) {
-                Ok(l) => l,
+                Ok(l) => {
+                    println!("Server listening at {}", acceptor_config.addrs.local);
+                    l
+                },
                 Err(_) => panic!(
                     "Failed to bind server at address {}.",
                     acceptor_config.addrs.local
@@ -280,10 +287,12 @@ impl Forwarder {
                 };
 
                 // start thread to wait for initial message
+                println!("Waiting for new client message");
                 let client_list = acceptor_clients.clone();
                 let sensor_ref = sensor_clone.clone();
                 let exists_ref = exists_clone.clone();
                 thread::spawn(move || {
+                    //TODO: maybe sleep here to wait for the read
                     match ws_stream.read() {
                         Ok(Message::Binary(data)) => {
                             // sensors send 'S' as first char in first message
@@ -308,6 +317,7 @@ impl Forwarder {
                                     },
                                     Err(e) => panic!("Sensor guard is poisoned: {e}"),
                                 }
+                                println!("Sensors connected");
                                 // return so socket isn't added to client list as well
                                 return;
                             }
@@ -316,7 +326,8 @@ impl Forwarder {
                             match client_list.write() {
                                 Ok(mut guard) => guard.push(Mutex::new(ws_stream)),
                                 Err(e) => panic!("Client guard is poisoned: {e}"),
-                            }
+                            };
+                            println!("Client connected");
                         }
                         Err(e) => eprintln!("Failed to get message from connection: {e}"),
                         _ => eprintln!("Unexpected message format encountered."),
