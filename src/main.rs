@@ -292,7 +292,6 @@ impl Forwarder {
                 let sensor_ref = sensor_clone.clone();
                 let exists_ref = exists_clone.clone();
                 thread::spawn(move || {
-                    //TODO: maybe sleep here to wait for the read
                     match ws_stream.read() {
                         Ok(Message::Binary(data)) => {
                             // sensors send 'S' as first char in first message
@@ -366,68 +365,79 @@ impl Forwarder {
                 Err(e) => panic!("Sensor bool guard is poisoned: {e}"),
             };
 
+            //attempt to get sensor mutex lock
+            let mut guard = match self.sensor_socket.lock() {
+                Ok(guard) => guard,
+                Err(e) => panic!("Sensor connection is poisoned: {e}"),
+            };
+
             // attempt to read from sensor socket
-            match self.sensor_socket.lock() {
-                Ok(mut guard) => match guard.as_mut() {
-                    //  if somehow no socket, drop lock and wait short time
-                    None => {
-                        drop(guard);
-                        sleep(Duration::from_millis(self.config.batch.interval / 2));
+            match guard.as_mut() {
+                //  if somehow no socket, drop lock and wait short time
+                None => {
+                    drop(guard);
+                    sleep(Duration::from_millis(self.config.batch.interval / 2));
+                    continue;
+                }
+                Some(socket) => match socket.read() {
+                    // data is in Bytes struct which is cheaply cloneable and all point to the same underlying memory
+                    Ok(Message::Binary(data)) => {
+                        #[cfg(debug_assertions)]
+                        let start = Instant::now();
+
+                        // broadcast data to all clients
+                        self.broadcast(data.clone());
+
+                        // send data to be stored in DB
+                        if let Err(e) = data_tx.send(data) {
+                            panic!("Failed to send data to the DB: {e}")
+                        }
+
+                        // check timing if a debug build
+                        #[cfg(debug_assertions)]
+                        {
+                            self.timing_samples.push(start.elapsed());
+                            if self.timing_samples.len() >= self.config.debug.interval {
+                                let (min, max, sum) = self
+                                    .timing_samples
+                                    .par_iter()
+                                    .fold(
+                                        || (Duration::MAX, Duration::ZERO, Duration::ZERO),
+                                        |(min, max, sum), &d| (min.min(d), max.max(d), sum + d),
+                                    )
+                                    .reduce(
+                                        || (Duration::MAX, Duration::ZERO, Duration::ZERO),
+                                        |(min_a, max_a, sum_a), (min_b, max_b, sum_b)| {
+                                            (min_a.min(min_b), max_a.max(max_b), sum_a + sum_b)
+                                        },
+                                    );
+                                println!(
+                                    "{} cycles took {} total seconds. Min: {}, Max: {}, Avg: {}",
+                                    self.config.debug.interval,
+                                    sum.as_secs(),
+                                    min.as_millis(),
+                                    max.as_millis(),
+                                    sum.as_millis() as usize/self.config.debug.interval
+                                );
+                                self.timing_samples.clear();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Sensors disconnected: {e}");
+                        match self.sensor_connected.write() {
+                            Ok(mut bool_guard) => {
+                                *bool_guard = false;
+                                *guard = None;
+                            }
+                            Err(e) => panic!("Sensor connected guard is poisoned: {e}"),
+                        }
+                    }
+                    _ => {
+                        eprintln!("Recieved unexpected message type from sensors.");
                         continue;
                     }
-                    Some(socket) => match socket.read() {
-                        // data is in Bytes struct which is cheaply cloneable and all point to the same underlying memory
-                        Ok(Message::Binary(data)) => {
-                            #[cfg(debug_assertions)]
-                            let start = Instant::now();
-
-                            // broadcast data to all clients
-                            self.broadcast(data.clone());
-
-                            // send data to be stored in DB
-                            if let Err(e) = data_tx.send(data) {
-                                panic!("Failed to send data to the DB: {e}")
-                            }
-
-                            // check timing if a debug build
-                            #[cfg(debug_assertions)]
-                            {
-                                self.timing_samples.push(start.elapsed());
-                                if self.timing_samples.len() >= self.config.debug.interval {
-                                    let (min, max, sum) = self
-                                        .timing_samples
-                                        .par_iter()
-                                        .fold(
-                                            || (Duration::MAX, Duration::ZERO, Duration::ZERO),
-                                            |(min, max, sum), &d| (min.min(d), max.max(d), sum + d),
-                                        )
-                                        .reduce(
-                                            || (Duration::MAX, Duration::ZERO, Duration::ZERO),
-                                            |(min_a, max_a, sum_a), (min_b, max_b, sum_b)| {
-                                                (min_a.min(min_b), max_a.max(max_b), sum_a + sum_b)
-                                            },
-                                        );
-                                    println!(
-                                        "{} cycles took {} total seconds. Min: {}, Max: {}, Avg: {}",
-                                        self.config.debug.interval,
-                                        sum.as_secs(),
-                                        min.as_millis(),
-                                        max.as_millis(),
-                                        sum.as_millis() as usize/self.config.debug.interval
-                                    );
-                                    self.timing_samples.clear();
-                                }
-                            }
-                        }
-                        //TODO: handle possible sensor disconnections here
-                        Err(e) => eprintln!("Sensors may have disconnected: {e}"),
-                        _ => {
-                            eprintln!("Recieved unexpected message type from sensors.");
-                            continue;
-                        }
-                    },
                 },
-                Err(e) => panic!("Sensor connection is poisoned: {e}"),
             };
         }
     }
