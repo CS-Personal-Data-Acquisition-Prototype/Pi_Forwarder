@@ -162,7 +162,7 @@ impl Forwarder {
                     Ok(mut stmt) => {
                         let batch_count = batch_config.batch.count;
                         match stmt.query_map(params![batch_count], |row| {
-                            row.get::<_, Vec<u8>>(0)
+                            row.get::<_, Vec<u8>>(1)
                                 .map(|blob| match String::from_utf8(blob) {
                                     Ok(blob_str) => {
                                         match serde_json::from_str::<DataPoint>(&blob_str) {
