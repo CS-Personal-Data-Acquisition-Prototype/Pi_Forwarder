@@ -234,20 +234,26 @@ impl Forwarder {
 
                     // send data via TCP to remote server
                     println!("Sending batch");
-                    if let Ok(mut stream) = TcpStream::connect(&batch_config.addrs.remote) {
-                        if let Err(e) = stream.write_all(request.as_bytes()) {
-                            eprintln!("Failed to write batch to stream: {e}")
-                        } else {
-                            // check for 204 response
-                            let mut response = String::new();
-                            let _ = stream.read_to_string(&mut response);
-
-                            if response.contains("HTTP/1.1 204") {
-                                if let Err(e) = tx.commit() {
-                                    eprintln!("Failed to commit transaction to DB: {e}")
+                    match TcpStream::connect(&batch_config.addrs.remote) {
+                        Ok(mut stream) => {
+                            if let Err(e) = stream.write_all(request.as_bytes()) {
+                                eprintln!("Failed to write batch to stream: {e}")
+                            } else {
+                                if let Err(e) = stream.flush() {
+                                    eprintln!("Failed to flush the stream: {e}")
+                                }
+                                // check for 204 response
+                                let mut response = String::new();
+                                let _ = stream.read_to_string(&mut response);
+    
+                                if response.contains("HTTP/1.1 204") {
+                                    if let Err(e) = tx.commit() {
+                                        eprintln!("Failed to commit transaction to DB: {e}")
+                                    }
                                 }
                             }
-                        }
+                        },
+                        Err(e) => eprintln!("Failed to connect to remote server at {:?}: {e}", &batch_config.addrs.remote),
                     }
                 } else {
                     println!("Nothing to batch");
