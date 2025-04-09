@@ -206,7 +206,7 @@ impl Forwarder {
                         }
                         if let Err(e) = write!(
                             &mut json_buffer,
-                            r#"{{"id":{},"datetime":{},data_blob:{}}}"#,
+                            r#"{{"id":{},"datetime":"{}",data_blob:{}}}"#,
                             SESSION_SENSOR_ID,
                             datapoint.timestamp,
                             match serde_json::to_string(&datapoint.sensor_blob) {
@@ -233,22 +233,25 @@ impl Forwarder {
                     );
 
                     // send data via TCP to remote server
-                    println!("Sending batch");
                     match TcpStream::connect(&batch_config.addrs.remote) {
                         Ok(mut stream) => {
+                            println!("Sending batch");
                             if let Err(e) = stream.write_all(request.as_bytes()) {
                                 eprintln!("Failed to write batch to stream: {e}")
                             } else {
                                 if let Err(e) = stream.flush() {
                                     eprintln!("Failed to flush the stream: {e}")
                                 }
+                                println!("Waiting for remote response");
                                 // check for 204 response
-                                let mut response = String::new();
-                                let _ = stream.read_to_string(&mut response);
+                                let mut response = Vec::new();
+                                let _ = stream.read(&mut response);
     
-                                if response.contains("HTTP/1.1 204") {
+                                if response.starts_with(b"HTTP/1.1 204") {
                                     if let Err(e) = tx.commit() {
                                         eprintln!("Failed to commit transaction to DB: {e}")
+                                    } else {
+                                        println!("Batch successful");
                                     }
                                 }
                             }
