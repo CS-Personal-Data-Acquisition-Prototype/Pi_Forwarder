@@ -206,7 +206,7 @@ impl Forwarder {
                         }
                         if let Err(e) = write!(
                             &mut json_buffer,
-                            r#"{{"id":{},"datetime":"{}",data_blob:{}}}"#,
+                            r#"{{"id":{},"datetime":"{}","data_blob":{}}}"#,
                             SESSION_SENSOR_ID,
                             datapoint.timestamp,
                             match serde_json::to_string(&datapoint.sensor_blob) {
