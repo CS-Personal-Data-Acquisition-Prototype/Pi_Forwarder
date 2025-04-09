@@ -7,7 +7,6 @@ edition = "2021"
 rusqlite = { version = "0.34", features = ["bundled"] }
 tungstenite = "0.26.2"
 threadpool = "1.8.1"
-num_cpus = "1.16"
 rayon = "1.1"
 toml = "0.8.2"
 serde = { version = "1.0.219", features = ["derive"] }

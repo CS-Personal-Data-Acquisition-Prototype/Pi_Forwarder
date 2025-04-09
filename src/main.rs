@@ -72,7 +72,7 @@ const BATCH_QUERY: &str = const_concat!(
     TABLE_NAME,
     " LIMIT ?1) RETURNING *"
 );
-const BATCH_DELIM: &[u8] = b"<EOF>";
+const DELIMITER: &[u8] = b"<EOF>";
 const SESSION_SENSOR_ID: usize = 1;
 
 #[derive(Deserialize)]
@@ -94,7 +94,6 @@ struct Forwarder {
 impl Forwarder {
     fn new(config: Config, mut source: PathBuf) -> Self {
         println!("Sqlite Version: {}", rusqlite::version());
-        println!("num cpus: {}", num_cpus::get());
 
         // open a connection to the db and create the table
         source.push("database");
@@ -218,8 +217,8 @@ impl Forwarder {
                             panic!("Failed to write to json buffer: {e}")
                         }
                     }
-                    let mut end_bytes: Vec<u8> = "]}{}".as_bytes().to_vec();
-                    end_bytes.extend(BATCH_DELIM);
+                    let mut end_bytes: Vec<u8> = "]}".as_bytes().to_vec();
+                    end_bytes.extend(DELIMITER);
                     json_buffer.append(&mut end_bytes);
 
                     #[cfg(debug_assertions)]
@@ -227,14 +226,14 @@ impl Forwarder {
 
                     // format TCP request
                     let request = format!(
-                        "POST {} HTTP/1,1\r\n
-                        Content-Type: application/json\r\n
-                        Content-Length: {}\r\n\r\n
-                        {}",
+                        "POST {} HTTP/1,1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                         &batch_config.addrs.endpoint,
                         &json_buffer.len(),
                         String::from_utf8_lossy(&json_buffer),
                     );
+
+                    #[cfg(debug_assertions)]
+                    println!("Request:\n{request}");
 
                     // send data via TCP to remote server
                     println!("Sending batch");
@@ -251,6 +250,8 @@ impl Forwarder {
                             }
                         }
                     }
+                } else {
+                    println!("Nothing to batch");
                 }
                 //tx and changes are dropped unless commit is ran in match statement
             }
