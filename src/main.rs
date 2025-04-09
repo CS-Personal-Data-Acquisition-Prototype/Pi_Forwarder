@@ -2,7 +2,13 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use rusqlite::{params, Connection};
 use serde::Deserialize;
 use std::{
-    fs::create_dir, io::{Read, Write}, net::{TcpListener, TcpStream}, path::PathBuf, sync::{mpsc, Arc, Mutex, RwLock}, thread::{self, sleep}, time::{Duration, Instant}
+    fs::create_dir,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+    path::PathBuf,
+    sync::{mpsc, Arc, Mutex, RwLock},
+    thread::{self, sleep},
+    time::{Duration, Instant},
 };
 use tungstenite::{accept, Bytes, Message, WebSocket};
 
@@ -66,6 +72,7 @@ const BATCH_QUERY: &str = const_concat!(
     TABLE_NAME,
     " LIMIT ?1) RETURNING *"
 );
+const BATCH_DELIM: &[u8] = b"<EOF>";
 const SESSION_SENSOR_ID: usize = 1;
 
 #[derive(Deserialize)]
@@ -211,7 +218,9 @@ impl Forwarder {
                             panic!("Failed to write to json buffer: {e}")
                         }
                     }
-                    json_buffer.append("]}".as_bytes().to_vec().as_mut());
+                    let mut end_bytes: Vec<u8> = "]}{}".as_bytes().to_vec();
+                    end_bytes.extend(BATCH_DELIM);
+                    json_buffer.append(&mut end_bytes);
 
                     #[cfg(debug_assertions)]
                     println!("Batch parse buffer size: {}", &json_buffer.capacity());
