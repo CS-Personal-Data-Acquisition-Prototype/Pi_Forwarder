@@ -232,13 +232,12 @@ impl Forwarder {
                         String::from_utf8_lossy(&json_buffer),
                     );
 
-                    #[cfg(debug_assertions)]
-                    println!("Request:\n{request}");
-
                     // send data via TCP to remote server
                     println!("Sending batch");
                     if let Ok(mut stream) = TcpStream::connect(&batch_config.addrs.remote) {
-                        if stream.write_all(request.as_bytes()).is_ok() {
+                        if let Err(e) = stream.write_all(request.as_bytes()) {
+                            eprintln!("Failed to write batch to stream: {e}")
+                        } else {
                             // check for 204 response
                             let mut response = String::new();
                             let _ = stream.read_to_string(&mut response);
