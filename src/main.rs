@@ -244,19 +244,26 @@ impl Forwarder {
                                 }
                                 println!("Waiting for remote response");
                                 // check for 204 response
-                                let mut response = Vec::new();
-                                let _ = stream.read(&mut response);
-    
+                                let mut response = vec![0; 128];
+                                if let Err(e) = stream.read(&mut response) {
+                                    eprintln!("Failed to read from stream: {e}")
+                                }
+
                                 if response.starts_with(b"HTTP/1.1 204") {
                                     if let Err(e) = tx.commit() {
                                         eprintln!("Failed to commit transaction to DB: {e}")
                                     } else {
                                         println!("Batch successful");
                                     }
+                                } else {
+                                    eprintln!("Recieved unexpected response: {:?}", response)
                                 }
                             }
-                        },
-                        Err(e) => eprintln!("Failed to connect to remote server at {:?}: {e}", &batch_config.addrs.remote),
+                        }
+                        Err(e) => eprintln!(
+                            "Failed to connect to remote server at {:?}: {e}",
+                            &batch_config.addrs.remote
+                        ),
                     }
                 } else {
                     println!("Nothing to batch");
