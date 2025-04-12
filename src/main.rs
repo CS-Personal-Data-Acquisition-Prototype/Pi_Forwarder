@@ -226,7 +226,7 @@ impl Forwarder {
 
                     // format TCP request
                     let request = format!(
-                        "POST {} HTTP/1,1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        "POST {} HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                         &batch_config.addrs.endpoint,
                         &json_buffer.len(),
                         String::from_utf8_lossy(&json_buffer),
