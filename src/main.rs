@@ -72,7 +72,6 @@ const BATCH_QUERY: &str = const_concat!(
     TABLE_NAME,
     " LIMIT ?1) RETURNING *"
 );
-const DELIMITER: &[u8] = b"<EOF>";
 const SESSION_SENSOR_ID: usize = 1;
 
 #[derive(Deserialize)]
@@ -143,7 +142,7 @@ impl Forwarder {
         let mut batch_db = self.get_db_conn();
         thread::spawn(move || {
             // get threads connection to DB
-            let mut json_buffer = Vec::with_capacity(32 * batch_config.batch.count); // TODO: adjust based on actual data size
+            let mut json_buffer = vec![0; 32 * batch_config.batch.count]; // TODO: adjust based on actual data size
             loop {
                 // send data once batch count is reached
                 sleep(Duration::from_secs(batch_config.batch.interval));
@@ -217,9 +216,7 @@ impl Forwarder {
                             panic!("Failed to write to json buffer: {e}")
                         }
                     }
-                    let mut end_bytes: Vec<u8> = "]}".as_bytes().to_vec();
-                    end_bytes.extend(DELIMITER);
-                    json_buffer.append(&mut end_bytes);
+                    json_buffer.append("]}".as_bytes().to_vec().as_mut());
 
                     #[cfg(debug_assertions)]
                     println!("Batch parse buffer size: {}", &json_buffer.capacity());
