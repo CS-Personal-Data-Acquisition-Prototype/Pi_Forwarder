@@ -147,6 +147,8 @@ impl Forwarder {
                 // send data once batch count is reached
                 sleep(Duration::from_secs(batch_config.batch.interval));
 
+                //TODO: if bool false, ping server to check connection and save to bool, only batch if bool is true, set bool to false if batch fails
+
                 // start transaction with DB connection
                 let tx = match batch_db.transaction() {
                     Ok(t) => t,
