@@ -1,85 +1,72 @@
-# Pi_Transmit
-
-A Rust utility for transmitting database data from a Raspberry Pi to a remote server automatically.
-
-## Overview
-
-Pi_Transmit is designed to facilitate the seamless transfer of database information from a Raspberry Pi device to a designated server. This tool is particularly useful for IoT applications, remote monitoring systems, and data collection scenarios where periodic data uploads are required.
+# Pi_Forwarder
+A Rust crate for forwarding low-latency sensor data to locally connected clients along with an internal SQLite database used for batching the data to a remote server for long-term storage.
 
 ## Features
+- Functions with recording rates of 100+ Hz
+- Zero-copy data handling
+- Parallel client broadcasting
+- Low-latency websocket client connections
+- Batched database synchonization
+- Deletes local data on synchonization confirmation by utilizing transactions
 
-- Automated database synchronization
-- Configurable transfer schedules
-- Secure data transmission
-- Error handling and retry mechanisms
-- Persistent connection management
+## Overview
+Pi_Forwarder recieves serial or networked sensor data; immediately forwarding that data by utilizing the rayon crate for parallelization, the Rust Bytes struct to allow each rayon thread to clone a reference to the underlying memory rather than the memory itself, along with low-latency websockets for real-time delivery to any connected clients; it then inserts the data into an internal SQLite database, which is periodically pulled from to batch transmit to a remote server via TCP.
 
 ## Setup
+1. Open a terminal on the Raspberry Pi where the repository will be cloned
 
-1. Clone this repository to your Raspberry Pi
-2. Install Rust and Cargo if not already installed
-   ```bash
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+2. Install the Rust toolchain if not already installed
+   - run the command
+      ```bash
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+      ```
+   - Hit enter again for the default installation
+   - Check it was installed correctly by running the following commands
+      ```bash
+      rustc --version
+      cargo --version
+      ```
+
+2. Clone the repository by running the following command
+   ```git
+      git clone https://github.com/CS-Personal-Data-Acquisition-Prototype/Pi_Forwarder.git
    ```
-3. Configure the `config.ini` file (see Configuration section)
-4. Build and run the project using Cargo
+
+3. Add the configuration file `config.toml` in `src` directory
+   - Follow the [Configuration](#configuration) section for format guidelines
+
+4. Run the program by running the following command
+   ```bash
+   cargo run --release
+   ```
 
 ## Configuration
+The `config.toml` file contains the following headers and default values
 
-The `config.ini` file contains essential settings for the application. Place this file in the `src` directory with the following sections:
+```toml
+[debug]
+interval = 3_000                             # number of cycles to collect data before printing, when not running in release
 
-```ini
-[server]
-ip = 0.0.0.0        ; IP address of the remote server
-port = 9000               ; Port number for the connection
-max_retries = 3           ; Number of retry attempts on connection failure
-retry_delay = 2           ; Delay (in seconds) between retry attempts
-
-[connection]
-persistent = true         ; Whether to maintain a persistent connection
-keep_alive_interval = 30  ; Interval (in seconds) for keep-alive signals
-connection_timeout = 60   ; Connection timeout in seconds
-auto_reconnect = true     ; Automatically reconnect if connection drops
-
-[transmission]
-continuous = true         ; Whether to transmit data continuously
-transmit_interval = 1.0   ; Time between transmissions in seconds
-buffer_size = 4096        ; Buffer size for data transmission
-batch_size = 100          ; Number of records to transmit in one batch
+[addrs]
+local = "0.0.0.0:8080"                       # address to start local websocket server to listen for connections on
+remote = "XX.X.X.XXX:7878"                   # address to send TCP batches to, with remote IP replacing the X
+endpoint = "/sessions-sensors-data/batch"    # specific endpoint to send TCP batch requests to
 
 [database]
-path = /home/pi/Pi_TCP/src/data_acquisition.db  ; Path to the SQLite database file
+file = "data_acquisition.db"                 # name of local database file
+
+[batch]
+interval = 10                                # time, in seconds, to wait between batches
+count = 10_000                               # max number of rows to send in a single TCP batch
+
 ```
 
-## Usage
+# License Notice
+To apply the Apache License to your work, attach the following boilerplate notice. The text should be enclosed in the appropriate comment syntax for the file format. We also recommend that a file or class name and description of purpose be included on the same "printed page" as the copyright notice for easier identification within third-party archives.
 
-To build and run the application:
-
-```bash
-cargo build --release
-cargo run --release
-```
-
-For running as a background service, you can create a systemd service file or use:
-
-```bash
-nohup cargo run --release > output.log &
-```
-
-## Troubleshooting
-
-Check the log output for detailed information about any errors encountered during transmission. Common issues include:
-- Network connectivity problems
-- Database access errors
-- Server connection failures
-- Transmission interruptions
-
-## License
-
-Copyright 2025 CS 462 Personal Data Acquisition Prototype Group
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-http://www.apache.org/licenses/LICENSE-2.0
+    Copyright 2025 CS 462 Personal Data Acquisition Prototype Group
+    
+    Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at
+    
+    http://www.apache.org/licenses/LICENSE-2.0
+    Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
