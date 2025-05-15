@@ -1,5 +1,5 @@
 # Ignore configuration files
-*config.toml
+*src/config.toml
 
 # Ignore database files
 *.db*
