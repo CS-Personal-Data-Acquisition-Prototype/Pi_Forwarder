@@ -26,16 +26,25 @@ Pi_Forwarder recieves serial or networked sensor data; immediately forwarding th
       rustc --version
       cargo --version
       ```
+   - Install build target by running the following command
+      ```bash
+      rustup target add aarch64-unknown-linux-gnu
+      ``` 
+   - Ensure Libudev-dev is installed for serial ports by running the following commands
+      ```bash
+      sudo apt update
+      sudo apt install libudev-dev
+      ```
 
-2. Clone the repository by running the following command
+3. Clone the repository by running the following command
    ```git
       git clone https://github.com/CS-Personal-Data-Acquisition-Prototype/Pi_Forwarder.git
    ```
 
-3. Add the configuration file `config.toml` in `src` directory
+4. Add the configuration file `config.toml` in `src` directory
    - Follow the [Configuration](#configuration) section for format guidelines
 
-4. Run the program by running the following command
+5. Run the program by running the following command
    ```bash
    cargo run --release
    ```
