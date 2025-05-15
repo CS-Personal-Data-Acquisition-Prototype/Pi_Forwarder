@@ -51,6 +51,8 @@ interval = 3_000                             # number of cycles to collect data 
 local = "0.0.0.0:8080"                       # address to start local websocket server to listen for connections on
 remote = "XX.X.X.XXX:7878"                   # address to send TCP batches to, with remote IP replacing the X
 endpoint = "/sessions-sensors-data/batch"    # specific endpoint to send TCP batch requests to
+# Serial port, baud rates, names, and size of data per read in bytes of desired sensors
+sensors = [["/dev/ttyACM0", 250000, "Force", 12], ["/dev/ttyACM2", 115200, "Potentiometers", 12], ["/dev/ttyUSB0", 115200, "9DOF", 12]] #["/dev/ttyACM1", 115200, "GPS", 12]
 
 [database]
 file = "data_acquisition.db"                 # name of local database file

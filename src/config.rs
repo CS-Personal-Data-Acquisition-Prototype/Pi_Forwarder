@@ -15,9 +15,10 @@ pub struct Debug {
 
 #[derive(Deserialize)]
 pub struct Addrs {
-    pub local: String,    // address to listen for connections on
-    pub remote: String,   // address to send TCP batches to
-    pub endpoint: String, // specific endpoint to send batch requests to
+    pub local: String,                  // address to listen for connections on
+    pub remote: String,                 // address to send TCP batches to
+    pub endpoint: String,               // specific endpoint to send batch requests to
+    pub sensors: toml::value::Array,    // array of sensor info in format [serial port, baud rate]
 }
 
 #[derive(Deserialize)]

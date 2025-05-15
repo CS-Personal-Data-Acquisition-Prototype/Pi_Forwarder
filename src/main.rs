@@ -1,3 +1,4 @@
+use bytes::BytesMut;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use rusqlite::{params, Connection};
 use serde::Deserialize;
@@ -72,12 +73,23 @@ const BATCH_QUERY: &str = const_concat!(
     TABLE_NAME,
     " LIMIT ?1) RETURNING *"
 );
-const SESSION_SENSOR_ID: usize = 1;
+const TARGET_INTERVAL: Duration = Duration::from_millis(10); // 100 hz
+const SPIN_TIME: Duration = Duration::from_micros(500);
+const NULL_DATA_BYTES: Bytes = Bytes::from_static(b"null");
+
+const SESSION_SENSOR_ID: usize = 1; // TODO: Remove hardcoded value
 
 #[derive(Deserialize)]
 struct DataPoint {
     timestamp: String,
     sensor_blob: serde_json::Value,
+}
+
+struct Sensor {
+    port: Box<dyn serialport::SerialPort + 'static>,
+    name: String,
+    offset: usize, // position in sensor buffer
+    size: usize,   // expected data size
 }
 
 struct Forwarder {
@@ -86,6 +98,7 @@ struct Forwarder {
     sensor_socket: Arc<Mutex<Option<WebSocket<TcpStream>>>>,
     sensor_connected: Arc<RwLock<bool>>,
     clients: Arc<RwLock<Vec<Mutex<WebSocket<TcpStream>>>>>,
+    serial_sensors: Vec<Sensor>,
     #[cfg(debug_assertions)]
     timing_samples: Vec<Duration>,
 }
@@ -104,12 +117,109 @@ impl Forwarder {
         source.push(&config.database.file);
         let sample_count = config.debug.interval;
 
+        // set up serial connection to sensors if in config
+        let serial_sensors = if config.addrs.sensors.is_empty() {
+            vec![]
+        } else {
+            let mut sensors: Vec<Sensor> = vec![];
+            #[cfg(debug_assertions)]
+            {
+                // print all avaliable ports
+                let ports = match serialport::available_ports() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("Falied to read avaliable ports: {e}");
+                        Vec::new()
+                    }
+                };
+                ports
+                    .iter()
+                    .for_each(|port| println!("Name: {}", port.port_name));
+            }
+
+            // connect to each sensor after validating their info
+            let mut offset: usize = 0;
+            config.addrs.sensors.iter().for_each(|val| {
+                match val.as_array() {
+                    Some(arr) => {
+                        let serial_port = match arr[0].as_str() {
+                            Some(port) => Some(port),
+                            None => {
+                                eprintln!("Failed to parse a sensor serial port as a string.");
+                                None
+                            }
+                        };
+                        let baud_rate = match arr[1].as_integer() {
+                            Some(rate) => Some(rate as u32),
+                            None => {
+                                eprintln!("Failed to parse a sensor baud rate as an integer.");
+                                None
+                            }
+                        };
+                        let name = match arr[2].as_str() {
+                            Some(name) => Some(name),
+                            None => {
+                                eprintln!("Failed to parse a sensor name as a str.");
+                                None
+                            }
+                        };
+                        let data_size = match arr[3].as_integer() {
+                            Some(size) => Some(size as usize),
+                            None => {
+                                eprintln!("Failed to parse a sensor data size as an integer.");
+                                None
+                            }
+                        };
+
+                        // open the port and push it to the vec
+                        if serial_port.is_some()
+                            && baud_rate.is_some()
+                            && name.is_some()
+                            && data_size.is_some()
+                        {
+                            println!(
+                                "Sensor port: {}, baud rate: {}, name: {}, size: {}",
+                                serial_port.unwrap(),
+                                baud_rate.unwrap(),
+                                name.unwrap(),
+                                data_size.unwrap(),
+                            );
+                            match serialport::new(serial_port.unwrap(), baud_rate.unwrap())
+                                .timeout(Duration::from_millis(1))
+                                .open()
+                            {
+                                Ok(port) => {
+                                    sensors.push(Sensor {
+                                        port,
+                                        name: name.unwrap().to_string(),
+                                        offset,
+                                        size: data_size.unwrap(),
+                                    });
+                                    offset += data_size.unwrap();
+                                }
+                                Err(e) => eprintln!(
+                                    "Failed to open port {} with baud rate {}: {e}",
+                                    serial_port.unwrap(),
+                                    baud_rate.unwrap()
+                                ),
+                            }
+                        }
+                    }
+                    None => {
+                        eprintln!("Failed to parse one of the sensor configurations as an array.")
+                    }
+                }
+            });
+            sensors
+        };
+
         let fwd = Forwarder {
             config: Arc::new(config),
             db_path: Arc::new(source),
             sensor_socket: Arc::new(Mutex::new(None)),
             sensor_connected: Arc::new(RwLock::new(false)),
             clients: Arc::new(RwLock::new(Vec::new())),
+            serial_sensors,
             #[cfg(debug_assertions)]
             timing_samples: Vec::with_capacity(sample_count),
         };
@@ -361,7 +471,6 @@ impl Forwarder {
             // get threads connection to DB
             loop {
                 match data_rx.recv() {
-                    //TODO: ensure data.to_vec() works as expected
                     Ok(data) => {
                         if let Err(e) = db_conn.execute(INSERT_QUERY, params![data.to_vec()]) {
                             panic!("Failed to execute INSERT_QUERY with DB connection: {e}")
@@ -373,91 +482,275 @@ impl Forwarder {
         });
 
         // start handling data on main thread
+        let mut next_interval = Instant::now();
+        let mut serial_buffer =
+            BytesMut::with_capacity(self.serial_sensors.iter().map(|sensor| sensor.size).sum());
         loop {
-            // continue loop if sensors aren't connected
-            match self.sensor_connected.read() {
-                Ok(guard) => {
-                    if !*guard {
-                        continue;
-                    }
-                }
-                Err(e) => panic!("Sensor bool guard is poisoned: {e}"),
-            };
+            #[cfg(debug_assertions)]
+            let start = Instant::now();
 
-            //attempt to get sensor mutex lock
-            let mut guard = match self.sensor_socket.lock() {
-                Ok(guard) => guard,
-                Err(e) => panic!("Sensor connection is poisoned: {e}"),
-            };
+            let data: Result<Bytes, String> = match self.serial_sensors.is_empty() {
+                // get data from serial ports into json format
+                false => {
+                    let mut result = Ok(());
+                    serial_buffer.fill(0);
 
-            // attempt to read from sensor socket
-            match guard.as_mut() {
-                //  if somehow no socket, drop lock and wait short time
-                None => {
-                    drop(guard);
-                    sleep(Duration::from_millis(self.config.batch.interval / 2));
-                    continue;
-                }
-                Some(socket) => match socket.read() {
-                    // data is in Bytes struct which is cheaply cloneable and all point to the same underlying memory
-                    Ok(Message::Binary(data)) => {
-                        #[cfg(debug_assertions)]
-                        let start = Instant::now();
-
-                        // broadcast data to all clients
-                        self.broadcast(data.clone());
-
-                        // send data to be stored in DB
-                        if let Err(e) = data_tx.send(data) {
-                            panic!("Failed to send data to the DB: {e}")
-                        }
-
-                        // check timing if a debug build
-                        #[cfg(debug_assertions)]
-                        {
-                            self.timing_samples.push(start.elapsed());
-                            if self.timing_samples.len() >= self.config.debug.interval {
-                                let (min, max, sum) = self
-                                    .timing_samples
-                                    .par_iter()
-                                    .fold(
-                                        || (Duration::MAX, Duration::ZERO, Duration::ZERO),
-                                        |(min, max, sum), &d| (min.min(d), max.max(d), sum + d),
-                                    )
-                                    .reduce(
-                                        || (Duration::MAX, Duration::ZERO, Duration::ZERO),
-                                        |(min_a, max_a, sum_a), (min_b, max_b, sum_b)| {
-                                            (min_a.min(min_b), max_a.max(max_b), sum_a + sum_b)
-                                        },
-                                    );
-                                println!(
-                                    "{} cycles took {} total seconds. Min: {}, Max: {}, Avg: {}",
-                                    self.config.debug.interval,
-                                    sum.as_secs(),
-                                    min.as_millis(),
-                                    max.as_millis(),
-                                    sum.as_millis() as usize / self.config.debug.interval
-                                );
-                                self.timing_samples.clear();
+                    // check if all sensors have data
+                    for sensor in &self.serial_sensors {
+                        match sensor.port.bytes_to_read() {
+                            Ok(n) => {
+                                if n <= 0 {
+                                    result = Err(format!(
+                                        "Port '{}' has no data avaliable, reported: {n}",
+                                        sensor.name
+                                    ));
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                result = Err(format!(
+                                    "Failed to check bytes on port '{}': {e}",
+                                    sensor.name
+                                ));
+                                break;
                             }
                         }
                     }
-                    Err(e) => {
-                        eprintln!("Sensors disconnected: {e}");
-                        match self.sensor_connected.write() {
-                            Ok(mut bool_guard) => {
-                                *bool_guard = false;
-                                *guard = None;
-                            }
-                            Err(e) => panic!("Sensor connected guard is poisoned: {e}"),
+
+                    if result.is_err() {
+                        Err(result.unwrap_err())
+                    } else {
+                        // read all data from sensors into respective slices
+                        for sensor in &mut self.serial_sensors {
+                            let buffer_slice =
+                                &mut serial_buffer[sensor.offset..sensor.offset + sensor.size];
+                            match sensor.port.read(buffer_slice) {
+                                //TODO: make sure read doesn't go past the buffer slice bounds
+                                Ok(n) => {
+                                    println!("Read '{}' bytes from sensor '{}'", n, sensor.name)
+                                }
+                                Err(e) => {
+                                    result = Err(format!(
+                                        "Failed to read from sensor '{}': {e}",
+                                        sensor.name
+                                    ));
+                                    break;
+                                }
+                            };
+                        }
+
+                        if result.is_err() {
+                            Err(result.unwrap_err())
+                        } else {
+                            let bytes = serial_buffer.clone().freeze();
+
+                            let mut parts = vec![Vec::new(); self.serial_sensors.len()];
+                            self.serial_sensors
+                                .iter()
+                                .enumerate()
+                                .for_each(|(i, sensor)| {
+                                    parts[i] = bytes[sensor.offset..sensor.offset + sensor.size]
+                                        .split(|&b| b == b',')
+                                        .map(|slice| Bytes::copy_from_slice(slice))
+                                        .collect::<Vec<Bytes>>();
+                                });
+
+                            println!(
+                                "Timestamp: {}",
+                                chrono::Utc::now()
+                                    .format("%Y-%m-%d %H:%M:%S%.9f")
+                                    .to_string()
+                            );
+
+                            let get_part = |i: usize, j: usize| -> Bytes {
+                                parts
+                                    .get(i)
+                                    .and_then(|bytes| bytes.get(j))
+                                    .cloned()
+                                    .unwrap_or(NULL_DATA_BYTES.clone())
+                            };
+
+                            let mut json_bytes = BytesMut::with_capacity(1_024); //TODO: replace with more accurate capacity
+                            json_bytes.extend_from_slice(b"{\"timestamp\": \"");
+                            json_bytes.extend_from_slice(
+                                chrono::Utc::now()
+                                    .format("%Y-%m-%d %H:%M:%S%.9f")
+                                    .to_string()
+                                    .as_bytes(),
+                            );
+
+                            json_bytes.extend_from_slice(b"\", \"sensor_blob\": {\"lat\": ");
+                            json_bytes.extend_from_slice(&NULL_DATA_BYTES); // lat
+
+                            json_bytes.extend_from_slice(b", \"lon\": ");
+                            json_bytes.extend_from_slice(&NULL_DATA_BYTES); // lon
+
+                            json_bytes.extend_from_slice(b", \"accel_x\": ");
+                            json_bytes.extend_from_slice(&get_part(2, 0)); // accel_x
+
+                            json_bytes.extend_from_slice(b", \"accel_y\": ");
+                            json_bytes.extend_from_slice(&get_part(2, 1)); // accel_y
+
+                            json_bytes.extend_from_slice(b", \"accel_z\": ");
+                            json_bytes.extend_from_slice(&get_part(2, 2)); // accel_z
+
+                            json_bytes.extend_from_slice(b", \"gyro_x\": ");
+                            json_bytes.extend_from_slice(&get_part(2, 3)); // gyro_x
+
+                            json_bytes.extend_from_slice(b", \"gyro_y\": ");
+                            json_bytes.extend_from_slice(&get_part(2, 4)); // gyro_y
+
+                            json_bytes.extend_from_slice(b", \"gyro_z\": ");
+                            json_bytes.extend_from_slice(&get_part(2, 5)); // gyro_z
+
+                            json_bytes.extend_from_slice(b", \"mag_x\": ");
+                            json_bytes.extend_from_slice(&NULL_DATA_BYTES); // mag_x
+
+                            json_bytes.extend_from_slice(b", \"mag_y\": ");
+                            json_bytes.extend_from_slice(&NULL_DATA_BYTES); // mag_y
+
+                            json_bytes.extend_from_slice(b", \"mag_z\": ");
+                            json_bytes.extend_from_slice(&NULL_DATA_BYTES); // mag_z
+
+                            json_bytes.extend_from_slice(b", \"force\": ");
+                            json_bytes.extend_from_slice(&get_part(0, 0)); // force / dac 2
+
+                            json_bytes.extend_from_slice(b", \"linear\": ");
+                            json_bytes.extend_from_slice(&get_part(1, 0)); // linear / dac 0 (or 1)
+
+                            json_bytes.extend_from_slice(b", \"string\": ");
+                            json_bytes.extend_from_slice(&get_part(1, 1)); // linear / dac 1 (or 0)
+                            json_bytes.extend_from_slice(b"}}");
+
+                            println!(
+                                "Serial recieved:\n{}",
+                                String::from_utf8(json_bytes.to_vec())
+                                    .unwrap_or("Error parsing json bytes to utf8".to_string())
+                            );
+
+                            Ok(json_bytes.freeze())
                         }
                     }
-                    _ => {
-                        eprintln!("Recieved unexpected message type from sensors.");
-                        continue;
+                }
+                // attempt to read from a websockets sensor connection
+                true => {
+                    let mut result = Ok(());
+                    // check if sensors are connected
+                    match self.sensor_connected.read() {
+                        Ok(guard) => {
+                            if !*guard {
+                                result = Err("No sensors are connected".to_string());
+                                continue; //TODO: remove continue
+                            }
+                        }
+                        Err(e) => panic!("Sensor bool guard is poisoned: {e}"),
+                    };
+
+                    if result.is_err() {
+                        Err(result.unwrap_err())
+                    } else {
+                        //attempt to get sensor mutex lock
+                        let mut guard = match self.sensor_socket.lock() {
+                            Ok(guard) => guard,
+                            Err(e) => panic!("Sensor connection is poisoned: {e}"),
+                        };
+
+                        // attempt to read from sensor socket
+                        let data = match guard.as_mut() {
+                            //  if somehow no socket, drop lock
+                            None => {
+                                //drop(guard);
+                                //sleep(Duration::from_millis(self.config.batch.interval / 2));
+                                result = Err("Expected socket connection is missing".to_string());
+                                None
+                            }
+                            Some(socket) => match socket.read() {
+                                // data is in Bytes struct which is cheaply cloneable and all point to the same underlying memory
+                                Ok(Message::Binary(data)) => Some(data),
+                                Err(e) => {
+                                    match self.sensor_connected.write() {
+                                        Ok(mut bool_guard) => {
+                                            *bool_guard = false;
+                                            *guard = None;
+                                        }
+                                        Err(e) => panic!("Sensor connected guard is poisoned: {e}"),
+                                    }
+                                    result = Err(format!("Sensors disconnected: {e}"));
+                                    None
+                                }
+                                _ => {
+                                    result = Err(format!(
+                                        "Recieved unexpected message type from sensors."
+                                    ));
+                                    None
+                                }
+                            },
+                        };
+
+                        if result.is_err() {
+                            Err(result.unwrap_err())
+                        } else {
+                            Ok(data.unwrap())
+                        }
                     }
-                },
+                }
             };
+
+            match data {
+                Ok(data) => {
+                    // broadcast data to all clients
+                    self.broadcast(data.clone());
+
+                    // send data to be stored in DB
+                    if let Err(e) = data_tx.send(data) {
+                        panic!("Failed to send data to the DB: {e}")
+                    }
+                }
+                Err(e) => eprintln!("Failed to recieve data: {e}"),
+            }
+
+            // check timing if a debug build
+            #[cfg(debug_assertions)]
+            {
+                self.timing_samples.push(start.elapsed());
+                if self.timing_samples.len() >= self.config.debug.interval {
+                    let (min, max, sum) = self
+                        .timing_samples
+                        .par_iter()
+                        .fold(
+                            || (Duration::MAX, Duration::ZERO, Duration::ZERO),
+                            |(min, max, sum), &d| (min.min(d), max.max(d), sum + d),
+                        )
+                        .reduce(
+                            || (Duration::MAX, Duration::ZERO, Duration::ZERO),
+                            |(min_a, max_a, sum_a), (min_b, max_b, sum_b)| {
+                                (min_a.min(min_b), max_a.max(max_b), sum_a + sum_b)
+                            },
+                        );
+                    println!(
+                        "{} cycles took {} total seconds. Min: {}, Max: {}, Avg: {}",
+                        self.config.debug.interval,
+                        sum.as_secs(),
+                        min.as_millis(),
+                        max.as_millis(),
+                        sum.as_millis() as usize / self.config.debug.interval
+                    );
+                    self.timing_samples.clear();
+                }
+            }
+
+            let now = Instant::now();
+            if now >= next_interval {
+                next_interval = now + TARGET_INTERVAL;
+            } else if now + SPIN_TIME < next_interval {
+                sleep(next_interval - SPIN_TIME - now);
+            }
+
+            while Instant::now() < next_interval {
+                std::hint::spin_loop();
+            }
+
+            next_interval += TARGET_INTERVAL;
         }
     }
 
